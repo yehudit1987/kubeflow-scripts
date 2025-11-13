@@ -1,0 +1,735 @@
+#!/usr/bin/env bash
+
+# Always run your script with --podman:
+# ./setup-kind.sh --plain --podman
+# ./setup-kind.sh --kubeflow --podman
+# ./setup-kind.sh --notebooks-v1 --podman
+# ./setup-kind.sh --notebooks-v2 --podman
+
+
+set -euo pipefail
+
+cluster_name="kind"
+mode="plain"
+use_podman=""
+kind_cmd=""
+kubeflow_repo_url="https://github.com/kubeflow/manifests"
+kubeflow_manifests_ref="v1.10.2"
+kubeflow_cm_version="1.18.2"
+notebooks_repo_url="https://github.com/kubeflow/notebooks"
+notebooks_registry_url="ghcr.io/kubeflow/notebooks"
+notebooks_manifests_ref="notebooks-v2"
+notebooks_commit_sha=""
+profile_namespace=""
+# Array to track temporary files for cleanup
+declare -a temp_files=()
+
+_cleanup_temp_files() {
+    local file
+    for file in "${temp_files[@]}"; do
+        if [ -n "$file" ] && [ -f "$file" ]; then
+            rm -f "$file"
+        fi
+    done
+}
+
+_usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+    --plain       Create a basic kind cluster (default)
+    --kubeflow    Create a kind cluster with Kubeflow installed
+    --notebooks-v1   Create a kind cluster with Kubeflow and Notebooks v1 installed
+    --notebooks-v2   Create a kind cluster with Kubeflow and Notebooks v2 installed
+    --podman      Use podman as the container runtime for kind (default: docker)
+    --debug       Enable debug mode (set -x) to show all commands executed
+
+Only one mode option may be specified at a time.
+EOF
+    exit 1
+}
+
+_check_env() {
+    local missing_tools=()
+    local tool
+
+    # Check for required tools
+    local required_tools=(
+        kind
+        kubectl
+        git
+        kustomize
+        jq
+        yq
+    )
+
+    # Add container runtime based on use_podman flag
+    if [ -n "$use_podman" ]; then
+        required_tools+=(podman)
+    else
+        required_tools+=(docker)
+    fi
+
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing_tools+=("$tool")
+        fi
+    done
+
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        echo "Error: The following required tools are not installed or not in PATH:" >&2
+        for tool in "${missing_tools[@]}"; do
+            echo "  - $tool" >&2
+        done
+        echo >&2
+        echo "Please install the missing tools before running this script." >&2
+        exit 1
+    fi
+}
+
+_parse_args() {
+    local flag_count=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --plain)
+                if [ $flag_count -gt 0 ]; then
+                    echo "Error: Only one mode flag may be specified at a time" >&2
+                    _usage
+                fi
+                mode="plain"
+                flag_count=$((flag_count + 1))
+                shift
+                ;;
+            --kubeflow)
+                if [ $flag_count -gt 0 ]; then
+                    echo "Error: Only one mode flag may be specified at a time" >&2
+                    _usage
+                fi
+                mode="kubeflow"
+                flag_count=$((flag_count + 1))
+                shift
+                ;;
+            --notebooks-v1)
+                if [ $flag_count -gt 0 ]; then
+                    echo "Error: Only one mode flag may be specified at a time" >&2
+                    _usage
+                fi
+                mode="notebooks-v1"
+                notebooks_manifests_ref="notebooks-v1"
+                flag_count=$((flag_count + 1))
+                shift
+                ;;
+            --notebooks-v2)
+                if [ $flag_count -gt 0 ]; then
+                    echo "Error: Only one mode flag may be specified at a time" >&2
+                    _usage
+                fi
+                mode="notebooks-v2"
+                notebooks_manifests_ref="notebooks-v2"
+                flag_count=$((flag_count + 1))
+                shift
+                ;;
+            --podman)
+                use_podman="podman"
+                shift
+                ;;
+            --debug)
+                trap 'set +x' EXIT
+                set -x
+                shift
+                ;;
+            -h|--help)
+                _usage
+                ;;
+            *)
+                echo "Error: Unknown option: $1" >&2
+                _usage
+                ;;
+        esac
+    done
+}
+
+_check_and_delete_if_exists() {
+    if eval "$kind_cmd get clusters" | grep -q "^${cluster_name}\$"; then
+        local resp
+        read -r -p "Cluster '${cluster_name}' already exists. Delete it? [y/N]: " resp
+        case "$resp" in
+            [yY][eE][sS]|[yY])
+                echo "Deleting existing cluster '${cluster_name}'..."
+                eval "$kind_cmd delete cluster --name \"${cluster_name}\""
+                ;;
+            *)
+                echo "Aborting. Cluster '${cluster_name}' not deleted."
+                exit 1
+                ;;
+        esac
+    fi
+}
+
+_get_notebooks_commit_sha() {
+    read -r notebooks_commit_sha _ < <(
+        git ls-remote "${notebooks_repo_url}.git" "refs/heads/${notebooks_manifests_ref}" "refs/tags/${notebooks_manifests_ref}"
+    )
+}
+
+# Generic wait function that ensures resources exist before waiting
+# Usage: _kubectl_wait <resource_type> [--namespace=<ns>] [--selector=<selector>] [--all] [--for=...] [--timeout=...]
+# This function accepts the same arguments as kubectl wait, but first polls
+# to ensure resources exist before issuing the wait command.
+_kubectl_wait() {
+    local wait_args=()
+    local get_args=()
+    local poll_interval=2      # Fixed polling interval in seconds
+    local poll_timeout=180     # Fixed polling timeout: 3 minutes
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --for=*|--for)
+                # --for is unique to wait, don't pass to get
+                wait_args+=("$1")
+                if [[ "$1" == "--for" ]]; then
+                    wait_args+=("$2")
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --all)
+                # --all is unique to wait, don't pass to get
+                wait_args+=("$1")
+                shift
+                ;;
+            --timeout=*|--timeout)
+                # --timeout is unique to wait, don't pass to get
+                wait_args+=("$1")
+                if [[ "$1" == "--timeout" ]]; then
+                    wait_args+=("$2")
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            *)
+                # All other arguments pass through to both get and wait
+                wait_args+=("$1")
+                get_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Poll until resources exist using kubectl get (without --for, --all, and --timeout)
+    # For List resources: check if items array has non-zero length
+    # For named resources: kubectl get will error if not found, so check exit code
+    # Temporarily disable set -e to handle expected failures gracefully
+    set +e
+    local elapsed=0
+    local json_output
+    local exit_code
+    while true; do
+        json_output=$(kubectl get "${get_args[@]}" -o json 2>&1)
+        exit_code=$?
+
+        if [ $exit_code -eq 0 ]; then
+            # Command succeeded - check if it's a List with items
+            local kind
+            kind=$(echo "$json_output" | jq -r '.kind // empty' 2>/dev/null)
+            if [ "$kind" = "List" ]; then
+                # List resource - check if items array has non-zero length
+                local items_length
+                items_length=$(echo "$json_output" | jq -r '.items | length' 2>/dev/null)
+                if [ -n "$items_length" ] && [ "$items_length" -gt 0 ]; then
+                    # Resources exist
+                    break
+                fi
+            else
+                # Named resource - if we got JSON without error, it exists
+                # (kubectl get errors if named resource not found)
+                if [ -n "$kind" ]; then
+                    # Resource exists
+                    break
+                fi
+            fi
+        fi
+
+        if [ $elapsed -ge $poll_timeout ]; then
+            set -e
+            echo "Error: Timeout waiting for resources to exist (timeout: ${poll_timeout}s)" >&2
+            return 1
+        fi
+        sleep $poll_interval
+        elapsed=$((elapsed + poll_interval))
+    done
+    # Re-enable set -e
+    set -e
+
+    # Resources exist, now execute kubectl wait with all original arguments
+    kubectl wait "${wait_args[@]}"
+}
+
+_create_kind_cluster() {
+    eval "$kind_cmd create cluster --name=\"${cluster_name}\" --config=<(cat <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  image: kindest/node:v1.32.0@sha256:c48c62eac5da28cdadcf560d1d8616cfa6783b58f0d94cf63ad1bf49600cb027
+  kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        "service-account-issuer": "https://kubernetes.default.svc"
+        "service-account-signing-key-file": "/etc/kubernetes/pki/sa.key"
+EOF
+    )"
+}
+
+_setup_kubeflow() {
+    local manifests_path="common/kubeflow-namespace/base"
+    kubectl apply -k "${kubeflow_repo_url}/${manifests_path}?ref=${kubeflow_manifests_ref}"
+
+    kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/v${kubeflow_cm_version}/cert-manager.yaml"
+
+    # wait for pods to be ready
+    _kubectl_wait pods \
+        --namespace cert-manager \
+        --for=condition=Ready \
+        --selector 'app in (cert-manager,webhook)' \
+        --timeout=180s
+
+    # wait for services to exist - this provides a meaningful delay for the
+    # endpoints controller to populate endpoints with pod references
+    _kubectl_wait services \
+        --namespace cert-manager \
+        --for=jsonpath='{.metadata.name}' \
+        --selector 'app in (cert-manager,webhook)' \
+        --timeout=180s
+
+    # wait for webhook to be ready (check that endpoints point to pods)
+    _kubectl_wait endpoints \
+        --namespace cert-manager \
+        --for=jsonpath='{.subsets[0].addresses[0].targetRef.kind}'=Pod \
+        --selector 'app in (cert-manager,webhook)' \
+        --timeout=180s
+
+    kubectl apply -k "${kubeflow_repo_url}/common/istio/istio-crds/base?ref=${kubeflow_manifests_ref}"
+    kubectl apply -k "${kubeflow_repo_url}/common/istio/istio-namespace/base?ref=${kubeflow_manifests_ref}"
+    kubectl apply -k "${kubeflow_repo_url}/common/istio/istio-install/overlays/oauth2-proxy?ref=${kubeflow_manifests_ref}"
+
+    # wait for pods in istio-system
+    _kubectl_wait pods \
+        --namespace istio-system \
+        --for=condition=Ready \
+        --all \
+        --timeout 300s
+
+    kubectl apply -k "${kubeflow_repo_url}/common/istio/kubeflow-istio-resources/base?ref=${kubeflow_manifests_ref}"
+
+    kubectl apply -k "${kubeflow_repo_url}/common/kubeflow-roles/base?ref=${kubeflow_manifests_ref}"
+
+    # oauth2-proxy - install
+    kubectl apply -k "${kubeflow_repo_url}/common/oauth2-proxy/overlays/m2m-dex-only?ref=${kubeflow_manifests_ref}"
+
+    # oauth2-proxy - wait for pods
+    _kubectl_wait pods \
+        --namespace oauth2-proxy \
+        --for=condition=Ready \
+        --selector 'app.kubernetes.io/name=oauth2-proxy' \
+        --timeout=180s
+
+    # dex - install
+    kubectl apply -k "${kubeflow_repo_url}/common/dex/overlays/oauth2-proxy?ref=${kubeflow_manifests_ref}"
+
+    # dex - wait for pods
+    _kubectl_wait pods \
+        --namespace auth \
+        --for=condition=Ready \
+        --all \
+        --timeout=180s
+
+    kubectl apply -k "${kubeflow_repo_url}/applications/profiles/upstream/overlays/kubeflow?ref=${kubeflow_manifests_ref}"
+
+    # wait for pods to be ready
+    _kubectl_wait pods \
+        --namespace kubeflow \
+        --for=condition=ready \
+        --selector kustomize.component=profiles \
+        --timeout=300s
+
+    kubectl apply -k "${kubeflow_repo_url}/applications/centraldashboard/overlays/oauth2-proxy?ref=${kubeflow_manifests_ref}"
+
+    # wait for pods to be ready
+    _kubectl_wait pods \
+        --namespace kubeflow \
+        --for=condition=ready \
+        --selector app=centraldashboard \
+        --timeout=300s
+
+    kubectl get configmap "centraldashboard-config" \
+        --namespace kubeflow \
+        --output json \
+        | jq '.data.links |= (
+            fromjson |
+            .menuLinks += [{
+                "icon": "book",
+                "items": [
+                    {
+                        "text": "Workspaces",
+                        "link": "/workspaces/workspaces"
+                    },
+                    {
+                        "text": "Workspace Kinds",
+                        "link": "/workspaces/workspacekinds"
+                    }
+                ],
+                "text": "Notebooks v2",
+                "type": "section"
+            }] |
+            tojson
+        )' \
+     | kubectl apply -f -
+}
+
+_setup_notebooks_v1() {
+
+  # Install network policies
+  kubectl apply -k "${kubeflow_repo_url}/common/networkpolicies/base?ref=${kubeflow_manifests_ref}"
+
+  # Install poddefaults-webhooks
+  kubectl apply -k "${kubeflow_repo_url}/applications/admission-webhook/upstream/overlays/cert-manager?ref=${kubeflow_manifests_ref}"
+
+  # wait for poddefaults-webhooks pods to be ready
+  _kubectl_wait pods \
+    --namespace kubeflow \
+    --for=condition=ready \
+    --selector app=poddefaults \
+    --timeout=300s
+
+  # Install notebook-controller
+  kubectl apply -k "${kubeflow_repo_url}/applications/jupyter/notebook-controller/upstream/overlays/kubeflow?ref=${kubeflow_manifests_ref}"
+
+  # wait for notebook-controller pods to be ready
+  _kubectl_wait pods \
+    --namespace kubeflow \
+    --for=condition=ready \
+    --selector app=notebook-controller \
+    --timeout=300s
+
+  # Install jupyter-web-app
+  kubectl apply -k "${kubeflow_repo_url}/applications/jupyter/jupyter-web-app/upstream/overlays/istio?ref=${kubeflow_manifests_ref}"
+
+  # wait for jupyter-web-app pods to be ready
+  _kubectl_wait pods \
+    --namespace kubeflow \
+    --for=condition=ready \
+    --selector app=jupyter-web-app \
+    --timeout=300s
+
+  kubectl apply -k "${kubeflow_repo_url}/applications/pvcviewer-controller/upstream/base?ref=${kubeflow_manifests_ref}"
+
+  # wait for pvcviewer-controller pods to be ready
+  _kubectl_wait pods \
+    --namespace kubeflow \
+    --for=condition=ready \
+    --selector app=pvcviewer \
+    --timeout=300s
+
+  # Install volumes-web-app
+  kubectl apply -k "${kubeflow_repo_url}/applications/volumes-web-app/upstream/overlays/istio?ref=${kubeflow_manifests_ref}"
+
+  # wait for volumes-web-app pods to be ready
+  _kubectl_wait pods \
+    --namespace kubeflow \
+    --for=condition=ready \
+    --selector app=volumes-web-app \
+    --timeout=300s
+
+  # Install tensorboard-controller
+  kubectl apply -k "${kubeflow_repo_url}/applications/tensorboard/tensorboard-controller/upstream/overlays/kubeflow?ref=${kubeflow_manifests_ref}"
+
+  # wait for tensorboard-controller pods to be ready
+  _kubectl_wait pods \
+    --namespace kubeflow \
+    --for=condition=ready \
+    --selector app=tensorboard-controller \
+    --timeout=300s
+
+  # Install tensorboards-web-app
+  kubectl apply -k "${kubeflow_repo_url}/applications/tensorboard/tensorboards-web-app/upstream/overlays/istio?ref=${kubeflow_manifests_ref}"
+
+  # wait for tensorboards-web-app pods to be ready
+  _kubectl_wait pods \
+    --namespace kubeflow \
+    --for=condition=ready \
+    --selector app=tensorboards-web-app \
+    --timeout=300s
+
+}
+
+_setup_notebooks_v2() {
+    local tmp_manifest_yaml
+    tmp_manifest_yaml=$(mktemp)
+    temp_files+=("$tmp_manifest_yaml")
+
+    local yq_filter='
+        (. | select(.kind == "Deployment") | .spec.template.spec.containers // [])
+        |= with(.[]; select(.image | contains(env(IMAGE))) |= .image = env(REGISTRY) + "/" + env(IMAGE) + ":sha-" + env(TAG))
+    '
+
+    local image_name="workspaces-controller"
+    kustomize build "${notebooks_repo_url}/workspaces/controller/config/default?ref=${notebooks_manifests_ref}" > "${tmp_manifest_yaml}"
+
+    REGISTRY="${notebooks_registry_url}" IMAGE="${image_name}" TAG="${notebooks_commit_sha}" yq eval "${yq_filter}" "${tmp_manifest_yaml}" \
+    | kubectl apply -f -
+
+    # wait for controller pods to be ready
+    _kubectl_wait pods \
+        --namespace kubeflow-workspaces \
+        --for=condition=ready \
+        --selector app.kubernetes.io/name=workspaces-controller \
+        --timeout=180s
+
+    # wait for controller webhook to be ready
+    _kubectl_wait endpoints \
+        --namespace kubeflow-workspaces \
+        --for=jsonpath='{.subsets[0].addresses[0].targetRef.kind}'=Pod \
+        --selector app.kubernetes.io/name=workspaces-controller \
+        --timeout=180s
+
+    image_name="workspaces-backend"
+    kustomize build "${notebooks_repo_url}/workspaces/backend/manifests/kustomize/overlays/istio?ref=${notebooks_manifests_ref}" > "$tmp_manifest_yaml"
+
+    REGISTRY="${notebooks_registry_url}" IMAGE="${image_name}" TAG="${notebooks_commit_sha}" yq eval "${yq_filter}" "${tmp_manifest_yaml}" \
+    | kubectl apply -f -
+
+    # wait for backend pods to be ready
+    _kubectl_wait pods \
+        --namespace kubeflow-workspaces \
+        --for=condition=ready \
+        --selector app.kubernetes.io/name=workspaces-backend \
+        --timeout=180s
+
+    image_name="workspaces-frontend"
+    kustomize build "${notebooks_repo_url}/workspaces/frontend/manifests/kustomize/overlays/istio?ref=${notebooks_manifests_ref}" > "$tmp_manifest_yaml"
+
+    REGISTRY="${notebooks_registry_url}" IMAGE="${image_name}" TAG="${notebooks_commit_sha}" yq eval "${yq_filter}" "${tmp_manifest_yaml}" \
+    | kubectl apply -f -
+
+    # wait for frontend pods to be ready
+    _kubectl_wait pods \
+        --namespace kubeflow-workspaces \
+        --for=condition=ready \
+        --selector app.kubernetes.io/name=workspaces-frontend \
+        --timeout=180s
+}
+
+_setup_sample_data() {
+  # Render profile manifest with kustomize
+  local tmp_manifest_yaml
+  tmp_manifest_yaml=$(mktemp)
+  temp_files+=("$tmp_manifest_yaml")
+  kustomize build "${kubeflow_repo_url}/common/user-namespace/base?ref=${kubeflow_manifests_ref}" > "${tmp_manifest_yaml}"
+
+  # Extract namespace name from the Profile resource in the rendered manifest using yq
+  # The namespace name is the same as the Profile name (metadata.name)
+  # Handle both List resources and separate YAML documents
+  # Try to find Profile in a List resource first
+  profile_namespace=$(yq eval '.items[] | select(.kind == "Profile") | .metadata.name' "${tmp_manifest_yaml}" 2>/dev/null | head -n1)
+  # If not found, search through individual YAML documents
+  if [ -z "$profile_namespace" ]; then
+    # Use yq to process all documents and find the Profile
+    profile_namespace=$(yq eval-all 'select(.kind == "Profile") | .metadata.name' "${tmp_manifest_yaml}" 2>/dev/null | head -n1)
+  fi
+
+  if [ -z "$profile_namespace" ]; then
+    echo "Error: Failed to extract namespace name from Profile resource in manifest" >&2
+    exit 1
+  fi
+
+  # Install profile
+  kubectl apply -f "${tmp_manifest_yaml}"
+
+  # profile - wait for namespace to be active
+  _kubectl_wait "namespaces/${profile_namespace}" \
+    --for=jsonpath='{.status.phase}'=Active \
+    --timeout=180s
+}
+
+_setup_notebooks_v1_sample_data() {
+
+  _setup_sample_data
+
+  # TODO: add sample data for notebooks-v1
+
+}
+
+_setup_notebooks_v2_sample_data() {
+
+  _setup_sample_data
+
+  # workspacekind - install
+  kubectl create \
+    --filename "https://raw.githubusercontent.com/kubeflow/notebooks/${notebooks_commit_sha}/workspaces/controller/config/samples/jupyterlab_v1beta1_workspacekind.yaml"
+
+  # workspacekind - wait for status to be populated
+  _kubectl_wait workspacekinds/jupyterlab \
+    --for=jsonpath='{.status.workspaces}' \
+    --timeout=60s
+
+  # workspace dependencies - install
+  kubectl create \
+    --namespace "${profile_namespace}" \
+    --filename "https://raw.githubusercontent.com/kubeflow/notebooks/${notebooks_commit_sha}/workspaces/controller/config/samples/common/workspace_home_pvc.yaml" \
+    --filename "https://raw.githubusercontent.com/kubeflow/notebooks/${notebooks_commit_sha}/workspaces/controller/config/samples/common/workspace_data_pvc.yaml" \
+    --filename "https://raw.githubusercontent.com/kubeflow/notebooks/${notebooks_commit_sha}/workspaces/controller/config/samples/common/workspace_secret.yaml"
+
+  # workspace - install
+  kubectl create \
+    --namespace "${profile_namespace}" \
+    --filename  "https://raw.githubusercontent.com/kubeflow/notebooks/${notebooks_commit_sha}/workspaces/controller/config/samples/jupyterlab_v1beta1_workspace.yaml"
+
+  # workspace - wait for running
+  _kubectl_wait workspaces/jupyterlab-workspace \
+    --namespace "${profile_namespace}" \
+    --for=jsonpath='{.status.state}=Running' \
+    --timeout=180s
+}
+
+_setup_local_access() {
+  # clusterissuer - install
+  kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-cluster-issuer
+spec:
+  selfSigned: {}
+EOF
+
+  # clusterissuer - wait for ready
+  _kubectl_wait clusterissuers/selfsigned-cluster-issuer \
+    --for=condition=Ready \
+    --timeout=60s
+
+  # certificate - install
+  kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kubeflow-cert
+  namespace: istio-system
+spec:
+  secretName: kubeflow-tls
+  duration: 8760h # 365 days
+  renewBefore: 720h # 30 days before expiry
+  commonName: kubeflow.example.com
+  dnsNames:
+    - kubeflow.example.com
+  issuerRef:
+    name: selfsigned-cluster-issuer
+    kind: ClusterIssuer
+EOF
+
+  # certificate - wait for ready
+  _kubectl_wait certificate/kubeflow-cert \
+    --namespace=istio-system \
+    --for=condition=Ready \
+    --timeout=60s
+
+  # kubeflow-gateway - add https server
+  kubectl get gateway/kubeflow-gateway \
+    --namespace kubeflow \
+    --output json \
+  | jq '
+    if any(.spec.servers[]; .port.number == 443)
+    then .
+    else
+      .spec.servers += [
+        {
+          "port":{
+            "name":"https",
+            "number":443,
+            "protocol":"HTTPS"
+          },
+          "tls":{
+            "mode":"SIMPLE",
+            "credentialName":"kubeflow-tls"
+          },
+          "hosts":["*"]
+        }
+      ] end' \
+  | kubectl apply -f -
+
+  grep -Eq '^127\.0\.0\.1[[:space:]]+kubeflow\.example\.com$' /etc/hosts || echo "127.0.0.1 kubeflow.example.com" \
+  | sudo tee -a /etc/hosts
+}
+
+_display_next_steps() {
+  cat <<EOF
+Next steps:
+
+- Run the following command to enable local access to Kubeflow Dashboard:
+
+  kubectl -n istio-system port-forward svc/istio-ingressgateway 8443:443
+
+- Open the following URL in your browser:
+
+  https://kubeflow.example.com:8443/
+
+- Login with the following credentials:
+
+  Username: user@example.com
+  Password: 12341234
+EOF
+}
+
+_main() {
+    # Set up trap to clean up temp files on exit
+    trap _cleanup_temp_files EXIT
+
+    _parse_args "$@"
+
+    # Set kind command based on use_podman flag
+    if [ -n "$use_podman" ]; then
+        kind_cmd="KIND_EXPERIMENTAL_PROVIDER=podman kind"
+    else
+        kind_cmd="kind"
+    fi
+
+    # Check that all required tools are available
+    _check_env
+
+    # Always create the base kind cluster first
+    _check_and_delete_if_exists
+    _create_kind_cluster
+
+    # Then add layers based on mode
+    case "$mode" in
+        plain)
+            # Just the base cluster, nothing more to do
+            ;;
+        kubeflow)
+            _setup_kubeflow
+            ;;
+        notebooks-v1)
+            _setup_kubeflow
+            _setup_notebooks_v1
+            _setup_notebooks_v1_sample_data
+            _setup_local_access
+            _display_next_steps
+            ;;
+        notebooks-v2)
+            _setup_kubeflow
+            _get_notebooks_commit_sha
+            _setup_notebooks_v2
+            _setup_notebooks_v2_sample_data
+            _setup_local_access
+            _display_next_steps
+            ;;
+    esac
+}
+
+_main "$@"
