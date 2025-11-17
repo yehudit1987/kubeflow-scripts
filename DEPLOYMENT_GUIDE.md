@@ -7,110 +7,7 @@
 **Issue:** Docker incompatibility with bleeding-edge kernel  
 **Solution:** Use Podman instead of Docker
 
----
-
-## Changes Made to Original Scripts
-
-### 1. `setup-kind.sh` - **NO CHANGES**
-
-The original script from [andyatmiami/kubeflow-scripts](https://github.com/andyatmiami/kubeflow-scripts/blob/main/setup/setup-kind) works as-is when using the `--podman` flag.
-
-**Location:** `setup/setup-kind.sh`
-
-**Original features used:**
-- ✅ `--podman` flag support (already present in original)
-- ✅ `--notebooks-v1` mode
-- ✅ Kubernetes v1.32.0 node image
-
----
-
-### 2. `build-and-deploy.sh` - **ADDED PODMAN SUPPORT**
-
-The original script from [andyatmiami/kubeflow-scripts](https://github.com/andyatmiami/kubeflow-scripts/blob/main/notebooks-v1/build-and-deploy.sh) only supported Docker. We added Podman support.
-
-**Location:** `notebooks-v1/build-and-deploy.sh`
-
-#### Changes Added:
-
-**a) Global Variables (lines 36-38):**
-```bash
-# Global variable for container runtime (set by parse_arguments)
-use_podman=""
-kind_cmd=""
-```
-
-**b) Command Line Argument Parsing (lines 451-454):**
-```bash
---podman)
-    use_podman="podman"
-    shift
-    ;;
-```
-
-**c) Help Text (lines 475-476):**
-```bash
-echo "  --podman             Use podman instead of docker for building and kind operations"
-echo "                       (default: docker)"
-```
-
-**d) Prerequisites Check (lines 804-814):**
-```bash
-# Check for appropriate container runtime
-if [ -n "$use_podman" ]; then
-    if ! command -v podman >/dev/null 2>&1; then
-        print_error "podman is not installed or not in PATH"
-        return 1
-    fi
-else
-    if ! command -v docker >/dev/null 2>&1; then
-        print_error "docker is not installed or not in PATH"
-        return 1
-    fi
-fi
-```
-
-**e) Image Loading Function (line 791):**
-```bash
-if ! eval "$kind_cmd load docker-image \"$full_image\""; then
-```
-Changed from hardcoded `kind load` to use `$kind_cmd` variable.
-
-**f) Main Function Initialization (lines 1092-1097):**
-```bash
-# Set kind command based on use_podman flag
-if [ -n "$use_podman" ]; then
-    kind_cmd="KIND_EXPERIMENTAL_PROVIDER=podman kind"
-else
-    kind_cmd="kind"
-fi
-```
-
----
-
-## Why These Changes Were Necessary
-
-### Root Cause: Kernel 6.14.2 Incompatibility with Docker
-
-**Problem:**
-- Fedora 42 (Rawhide) ships with kernel 6.14.2, which is bleeding-edge
-- Docker (even v28.5.1) has issues with systemd inside containers on this kernel
-- Kind clusters using Docker fail with: `kubelet is unhealthy due to: The kubelet is not running`
-- Error: `The HTTP call equal to 'curl -sSL http://127.0.0.1:10248/healthz' returned error: Get "http://127.0.0.1:10248/healthz": context deadline exceeded`
-
-**Why Podman Works:**
-- Podman is designed specifically for Red Hat-based systems (Fedora/RHEL)
-- Better integration with newer kernels and cgroup v2
-- Native support for rootless containers
-- Better handling of systemd inside containers
-
-**Additional Issue Encountered:**
-- Initial profiles deployment failed with: `too many open files`
-- Solution: Increase inotify limits
-  ```bash
-  echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.conf
-  echo "fs.inotify.max_user_instances=512" | sudo tee -a /etc/sysctl.conf
-  sudo sysctl -p
-  ```
+> **📝 Note:** For detailed information about all fixes and modifications applied to the scripts, see [FIXES.md](./FIXES.md)
 
 ---
 
@@ -347,6 +244,7 @@ The scripts are portable - the same deployment process works on any system, just
 
 ## References
 
+- **[FIXES.md](./FIXES.md)** - Complete documentation of all fixes applied to scripts
 - Original scripts: [andyatmiami/kubeflow-scripts](https://github.com/andyatmiami/kubeflow-scripts)
 - Kubeflow manifests: [kubeflow/manifests v1.10.2](https://github.com/kubeflow/manifests/tree/v1.10.2)
 - Kind documentation: [kind.sigs.k8s.io](https://kind.sigs.k8s.io/)

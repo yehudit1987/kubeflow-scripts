@@ -48,15 +48,19 @@ Open: https://kubeflow.example.com:8443/
 
 ## 📖 Documentation
 
-See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for detailed deployment instructions, troubleshooting, and system requirements.
+- **[DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)** - Complete deployment guide with step-by-step instructions
+- **[FIXES.md](FIXES.md)** - Detailed documentation of all fixes and modifications applied
 
 ## 🔄 Changes from Original
 
 This repository is based on [andyatmiami/kubeflow-scripts](https://github.com/andyatmiami/kubeflow-scripts) with the following enhancements:
 
 - ✅ Added Podman support to `build-and-deploy.sh`
+- ✅ Fixed JWT/JWKS authentication issue in `setup-kind.sh`
 - ✅ Comprehensive deployment documentation
 - ✅ Tested on Fedora 42 (kernel 6.14.2)
+
+See [FIXES.md](FIXES.md) for complete details on all modifications.
 
 ## 🐛 Troubleshooting
 

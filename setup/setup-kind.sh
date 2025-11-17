@@ -391,6 +391,11 @@ _setup_kubeflow() {
             tojson
         )' \
      | kubectl apply -f -
+
+    # Fix RequestAuthentication to include jwksUri for JWT validation
+    # This is a workaround for missing jwksUri in upstream Kubeflow manifests
+    kubectl patch requestauthentication dex-jwt -n istio-system --type=json \
+        -p='[{"op": "add", "path": "/spec/jwtRules/0/jwksUri", "value": "http://dex.auth.svc.cluster.local:5556/dex/keys"}]'
 }
 
 _setup_notebooks_v1() {
